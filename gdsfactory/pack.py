@@ -5,9 +5,11 @@ Adapted from PHIDL https://github.com/amccaugh/phidl/ by Adam McCaughan
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Any
 
+import gdstk
 import numpy as np
 from pydantic import validate_call
 
@@ -81,12 +83,161 @@ def _pack_single_bin(
             break
 
     # Separate packed from unpacked rectangles, make dicts of form {id:(x,y,w,h)}
-    packed_rect_dict = {r[-1]: r[:-1] for r in rect_packer[0].rect_list()}
+    packed_rect_dict = {r[-1]: [*r[:-1], 0] for r in rect_packer[0].rect_list()}
     unpacked_rect_dict = {
         k: v for k, v in rect_dict.items() if k not in packed_rect_dict
     }
 
+    print(box_size)
+
     return packed_rect_dict, unpacked_rect_dict
+
+
+def _can_place_cell(
+    cell: list[gdstk.Polygon],
+    container: gdstk.Polygon,
+    existing_polygons: list[gdstk.Polygon],
+    spacing: int,
+) -> bool:
+    """Check if all polygons in the cell can be placed in the container without overlapping."""
+    for poly in cell:
+        if not container.contain_all(*poly.points):
+            return False
+        for existing in existing_polygons:
+            if existing.layer == poly.layer:
+                if (
+                    len(
+                        gdstk.boolean(
+                            gdstk.offset([existing], spacing / 2, join="miter")[0],
+                            gdstk.offset([poly], spacing / 2, join="miter")[0],
+                            "and",
+                        )
+                    )
+                    > 0
+                ):
+                    # print("whwhw!!!: ", existing.points)
+                    return False
+    return True
+
+
+def _pack_advanced(
+    component_list: list[Component],
+    rect_dict: dict[int, tuple[Number, Number]],
+    spacing: float,
+    aspect_ratio: Float2,
+    max_size: tuple[float | None, float | None],
+    density: float,
+    precision: float,
+    estimate_area: Number | None = None,
+) -> dict[int, tuple[Number, Number, Number, Number]]:
+    """Packs a list of components and into a bin as small as possible
+    with aspect ratio `aspect_ratio`.
+
+    Args:
+        component_list: dict of components to pack.
+        rect_dict: dict of rectangles {id: (w, h)}
+        spacing: minimum distance between adjacent shapes.
+        aspect_ratio: x, y.
+        max_size: tuple of max X, Y size.
+        density: of packing, closer to 1 packs tighter (more compute heavy).
+
+    Returns:
+        A list of packed components expressed as rectangles.
+
+    """
+
+    # cell_list = [comp._cell for comp in component_list]
+
+    # Compute total area and use it for an initial estimate of the bin size
+    total_area = (
+        estimate_area if estimate_area else sum(r[0] * r[1] for r in rect_dict.values())
+    )
+
+    aspect_ratio = np.asarray(aspect_ratio) / np.linalg.norm(aspect_ratio)  # Normalize
+
+    box_size = np.asarray(aspect_ratio * np.sqrt(total_area), dtype=np.float64)
+    box_size = np.clip(box_size, None, max_size)
+
+    while True:
+        placed_polygons = []
+
+        container = gdstk.Polygon(
+            [
+                (0, 0),
+                (box_size[0] * precision, 0),
+                (box_size[0] * precision, box_size[1] * precision),
+                (0, box_size[1] * precision),
+            ]
+        )
+
+        packed_rect_dict = {}
+
+        all_cells_placed = True
+
+        x_base = {}
+        y_base = 0
+
+        for i, comp in enumerate(component_list):
+            placed = False
+
+            normalize_displacement = [-coord for coord in comp._cell.bounding_box()[0]]
+            # print("Start placing new cell")
+            for y in range(y_base, int(box_size[1])):
+                for x in range(x_base[y] if y in x_base else 0, int(box_size[0])):
+                    for angle in [0, math.pi / 2, math.pi, math.pi * 3 / 2]:
+                        moved_cell = [
+                            poly.copy()
+                            .translate(*normalize_displacement)
+                            .rotate(angle)
+                            .translate(x * precision, y * precision)
+                            for poly in comp._cell.get_polygons()
+                        ]
+                        # moved_cell = [poly.copy().rotate(angle).translate(x*precision, y*precision) for poly in comp._cell.get_polygons()]
+                        # print(moved_cell[0].points)
+                        # print([poly.points for poly in placed_polygons])
+                        if _can_place_cell(
+                            moved_cell, container, placed_polygons, int(spacing)
+                        ):
+                            placed_polygons.extend(moved_cell)
+                            # packed_rect_dict[i] = [x, y, rect_dict[i][0]*abs(math.cos(angle))+rect_dict[i][1]*abs(math.sin(angle)), rect_dict[i][0]*abs(math.sin(angle))+rect_dict[i][1]*abs(math.cos(angle)), angle]
+                            bboxs = [poly.bounding_box() for poly in moved_cell]
+                            bbox_lx = min([bbox[0][0] for bbox in bboxs])
+                            bbox_ly = min([bbox[0][1] for bbox in bboxs])
+                            bbox_rx = max([bbox[1][0] for bbox in bboxs])
+                            bbox_ry = max([bbox[1][1] for bbox in bboxs])
+                            packed_rect_dict[i] = [
+                                bbox_lx,
+                                bbox_ly,
+                                bbox_rx - bbox_lx,
+                                bbox_ry - bbox_ly,
+                                angle,
+                            ]
+                            placed = True
+                            # x_base = x
+                            # y_base = y
+                            # x_base[y] = x
+                            break
+
+                    if placed:
+                        break
+                if placed:
+                    break
+
+            if not placed:
+                all_cells_placed = False
+                break
+
+        if all_cells_placed:
+            break
+
+        box_size *= density  # Increase area to try to fit
+        box_size = np.clip(box_size, None, max_size)
+        if all(box_size >= max_size):
+            break
+
+    print(box_size)
+
+    return packed_rect_dict
 
 
 @validate_call
@@ -110,6 +261,8 @@ def pack(
     v_mirror: bool = False,
     add_ports_prefix: bool = True,
     add_ports_suffix: bool = False,
+    advanced_packer: bool = False,
+    estimated_area: Number | None = None,
 ) -> list[Component]:
     """Pack a list of components into as few Components as possible.
 
@@ -183,15 +336,30 @@ def pack(
         rect_dict[n] = (w, h)
 
     packed_list = []
-    while rect_dict:
-        (packed_rect_dict, rect_dict) = _pack_single_bin(
-            rect_dict,
-            aspect_ratio=aspect_ratio,
-            max_size=max_size,
-            sort_by_area=sort_by_area,
-            density=density,
+
+    if advanced_packer:
+        packed_list.append(
+            _pack_advanced(
+                component_list,
+                rect_dict,
+                spacing,
+                aspect_ratio,
+                max_size,
+                density,
+                precision,
+                estimated_area,
+            )
         )
-        packed_list.append(packed_rect_dict)
+    else:
+        while rect_dict:
+            (packed_rect_dict, rect_dict) = _pack_single_bin(
+                rect_dict,
+                aspect_ratio=aspect_ratio,
+                max_size=max_size,
+                sort_by_area=sort_by_area,
+                density=density,
+            )
+            packed_list.append(packed_rect_dict)
 
     components_packed_list = []
     index = 0
@@ -200,11 +368,15 @@ def pack(
         packed = Component(name, with_uuid=True)
         packed.info["components"] = {}
         for n, rect in rect_dict.items():
-            x, y, w, h = rect
+            # print(rect)
+            x, y, w, h, r = rect
             xcenter = x + w / 2 + spacing / 2
             ycenter = y + h / 2 + spacing / 2
             component = component_list[n]
-            d = component.ref(rotation=rotation, h_mirror=h_mirror, v_mirror=v_mirror)
+            # d = component.ref(rotation=r/math.pi*180, h_mirror=h_mirror, v_mirror=v_mirror)
+            d = component.ref(
+                rotation=r / math.pi * 180, h_mirror=h_mirror, v_mirror=v_mirror
+            )
             packed.add(d)
 
             if hasattr(component, "settings"):
